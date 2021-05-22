@@ -1,7 +1,7 @@
 #![feature(stdsimd)]
 
 use ahash::RandomState;
-use flize::{Atomic, Collector, Shared, ThinShield};
+use flize::{Atomic, Collector, NullTag, Shared, ThinShield};
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     sync::atomic::{
@@ -19,7 +19,7 @@ pub type DefaultHashBuilder = ahash::RandomState;
 
 #[derive(Debug)]
 struct Bucket<V> {
-    head: Atomic<LeafNode<V>>,
+    head: Atomic<LeafNode<V>, NullTag, NullTag, 0, 0>,
     collector: Collector,
 }
 
@@ -28,7 +28,7 @@ where
     V: Clone,
 {
     #[inline]
-    fn find_item<'g>(&self, key: usize) -> Option<Shared<'g, LeafNode<V>>> {
+    fn find_item<'g>(&self, key: usize) -> Option<Shared<'g, LeafNode<V>, NullTag, NullTag, 0, 0>> {
         unsafe {
             let danger = flize::unprotected();
             let mut checking = self.head.load(Relaxed, danger);
@@ -151,7 +151,10 @@ where
     }
 
     #[inline]
-    pub fn try_get<'a>(&self, key: usize) -> Option<Shared<'a, LeafNode<V>>> {
+    pub fn try_get<'a>(
+        &self,
+        key: usize,
+    ) -> Option<Shared<'a, LeafNode<V>, NullTag, NullTag, 0, 0>> {
         self.find_item(key)
     }
 }

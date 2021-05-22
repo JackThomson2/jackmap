@@ -1,14 +1,14 @@
-use flize::{Atomic, Shared};
+use flize::{Atomic, NullTag, Shared};
 
 pub struct LeafNode<V> {
     pub key: usize,
-    pub data: Atomic<V>,
-    pub low: Atomic<LeafNode<V>>,
-    pub high: Atomic<LeafNode<V>>,
+    pub data: Atomic<V, NullTag, NullTag, 0, 0>,
+    pub low: Atomic<LeafNode<V>, NullTag, NullTag, 0, 0>,
+    pub high: Atomic<LeafNode<V>, NullTag, NullTag, 0, 0>,
 }
 
 impl<V> LeafNode<V> {
-    pub fn new(key: usize, data: Shared<V>) -> Self {
+    pub fn new(key: usize, data: Shared<V, NullTag, NullTag, 0, 0>) -> Self {
         Self {
             key,
             data: Atomic::new(data),
