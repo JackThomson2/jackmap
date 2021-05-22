@@ -6,7 +6,7 @@ use std::{
     hash::{BuildHasher, Hash, Hasher},
     sync::atomic::{
         AtomicUsize,
-        Ordering::{Acquire, Relaxed, Release, SeqCst},
+        Ordering::{Acquire, Relaxed, SeqCst},
     },
     usize,
 };
@@ -237,21 +237,21 @@ mod tests {
     #[test]
     fn threaded_test() {
         let jacktable = Arc::new(JackMap::new(200));
-        const INSTERT_COUNT: usize = 2_000_000;
+        const INSTERT_COUNT: usize = 200;
 
         let table_a = jacktable.clone();
         let a = thread::spawn(move || {
             for i in 0..INSTERT_COUNT {
                 let string = format!("Key {}", i);
-                table_a.insert(&string, i);
+                table_a.insert(&string, "Thread A");
             }
         });
 
         let table_b = jacktable.clone();
         let b = thread::spawn(move || {
-            for i in 0..INSTERT_COUNT {
+            for i in (0..INSTERT_COUNT).rev() {
                 let string = format!("Key {}", i);
-                table_b.insert(&string, i);
+                table_b.insert(&string, "Thread B");
             }
         });
 
@@ -259,15 +259,15 @@ mod tests {
         let c = thread::spawn(move || {
             for i in 0..INSTERT_COUNT {
                 let string = format!("Key {}", i);
-                table_c.insert(&string, i);
+                table_c.insert(&string, "Thread C");
             }
         });
 
         let table_d = jacktable.clone();
         let d = thread::spawn(move || {
-            for i in 0..INSTERT_COUNT {
+            for i in (0..INSTERT_COUNT).rev() {
                 let string = format!("Key {}", i);
-                table_d.insert(&string, i);
+                table_d.insert(&string, "Thread D");
             }
         });
 
@@ -275,6 +275,13 @@ mod tests {
         b.join();
         c.join();
         d.join();
+
+        for i in 0..INSTERT_COUNT {
+            let string = format!("Key {}", i);
+            let a = jacktable.get(&string);
+
+            println!("We got {:?}", a);
+        }
 
         println!("Done!! we have {} items ", jacktable.size());
     }
