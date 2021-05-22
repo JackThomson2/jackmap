@@ -4,8 +4,11 @@ use ahash::RandomState;
 use flize::{Atomic, Collector, Shared, ThinShield};
 use std::{
     hash::{BuildHasher, Hash, Hasher},
-    sync::atomic::Ordering::{Acquire, Relaxed, SeqCst},
-    usize, vec,
+    sync::atomic::{
+        AtomicUsize,
+        Ordering::{Acquire, Relaxed, Release, SeqCst},
+    },
+    usize,
 };
 
 mod leaf;
@@ -39,27 +42,32 @@ where
                     return Some(checking);
                 }
 
-                checking = leaf.next.load(Relaxed, guard)
+                checking = if leaf.key > key {
+                    leaf.low.load(Relaxed, guard)
+                } else {
+                    leaf.high.load(Relaxed, guard)
+                };
             }
         }
     }
 
     #[inline]
-    pub fn insert_item(&self, key: usize, value: V) {
+    pub fn insert_item(&self, key: usize, value: V) -> bool {
         let shield = self.collector.thin_shield();
 
         let new =
             unsafe { Shared::from_ptr(Box::into_raw(Box::new(LeafNode::new(key, value.clone())))) };
 
-        loop {
-            let head = self.head.load(Relaxed, &shield);
+        let data = unsafe { Shared::from_ptr(Box::into_raw(Box::new(value))) };
+        'outer: loop {
+            let head = self.head.load(Acquire, &shield);
 
             if head.is_null() {
                 match self
                     .head
                     .compare_exchange(head, new, Acquire, Relaxed, &shield)
                 {
-                    Ok(_) => return,
+                    Ok(_) => return true,
                     Err(_owned) => continue,
                 }
             }
@@ -68,21 +76,42 @@ where
                 let mut above = head;
                 let mut checking = head;
 
+                let mut low = above.as_ref_unchecked().key > key;
+
                 loop {
                     if checking.is_null() {
-                        above.as_mut_ref_unchecked().next.store(new, SeqCst);
-                        return;
+                        let referencing = if low {
+                            &above.as_ref_unchecked().low
+                        } else {
+                            &above.as_ref_unchecked().high
+                        };
+
+                        match referencing.compare_exchange(checking, new, Acquire, Relaxed, &shield)
+                        {
+                            Ok(_) => {
+                                return true;
+                            }
+                            Err(_) => {
+                                continue 'outer;
+                            }
+                        }
                     }
 
                     let item = checking.as_mut_ref_unchecked();
 
                     if item.key == key {
-                        item.data = value.clone();
-                        return;
+                        item.data.store(data, SeqCst);
+                        return false;
                     }
 
+                    low = checking.as_ref_unchecked().key > key;
+
                     above = checking;
-                    checking = checking.as_ref_unchecked().next.load(Acquire, &shield)
+                    checking = if low {
+                        checking.as_ref_unchecked().low.load(Acquire, &shield)
+                    } else {
+                        checking.as_ref_unchecked().high.load(Acquire, &shield)
+                    };
                 }
             }
         }
@@ -116,7 +145,7 @@ impl<V> Default for Bucket<V> {
 }
 
 pub struct JackMap<V, S = DefaultHashBuilder> {
-    size: usize,
+    size: AtomicUsize,
 
     num_buckets: usize,
     buckets: Vec<Bucket<V>>,
@@ -138,7 +167,7 @@ where
         let hasher = RandomState::new();
 
         Self {
-            size: 0,
+            size: AtomicUsize::new(0),
             num_buckets,
             buckets,
             hasher,
@@ -158,22 +187,22 @@ where
     }
 
     #[inline]
-    pub fn insert<K: 'a + Hash>(&mut self, key: &K, value: V) {
+    pub fn insert<K: 'a + Hash>(&self, key: &K, value: V) {
         let key = self.hash_key(key);
         let bucket = self.determine_bucket(key);
 
         unsafe {
-            self.buckets
-                .get_unchecked_mut(bucket)
-                .insert_item(key, value);
-        }
+            let res = self.buckets.get_unchecked(bucket).insert_item(key, value);
 
-        self.size += 1;
+            if res {
+                self.size.fetch_add(1, Relaxed);
+            }
+        }
     }
 
     #[inline]
     pub fn size(&self) -> usize {
-        self.size
+        self.size.load(Relaxed)
     }
 
     #[inline]
@@ -187,7 +216,13 @@ where
 
         unsafe {
             match node.try_get(key, &shield) {
-                Some(res) => Some(res.as_ref_unchecked().data.clone()),
+                Some(res) => Some(
+                    res.as_ref_unchecked()
+                        .data
+                        .load(Relaxed, &shield)
+                        .as_ref_unchecked()
+                        .clone(),
+                ),
                 None => None,
             }
         }
@@ -197,26 +232,78 @@ where
 #[cfg(test)]
 mod tests {
     use crate::JackMap;
+    use std::{sync::Arc, thread};
+
+    #[test]
+    fn threaded_test() {
+        let jacktable = Arc::new(JackMap::new(200));
+        const INSTERT_COUNT: usize = 2_000_000;
+
+        let table_a = jacktable.clone();
+        let a = thread::spawn(move || {
+            for i in 0..INSTERT_COUNT {
+                let string = format!("Key {}", i);
+                table_a.insert(&string, i);
+            }
+        });
+
+        let table_b = jacktable.clone();
+        let b = thread::spawn(move || {
+            for i in 0..INSTERT_COUNT {
+                let string = format!("Key {}", i);
+                table_b.insert(&string, i);
+            }
+        });
+
+        let table_c = jacktable.clone();
+        let c = thread::spawn(move || {
+            for i in 0..INSTERT_COUNT {
+                let string = format!("Key {}", i);
+                table_c.insert(&string, i);
+            }
+        });
+
+        let table_d = jacktable.clone();
+        let d = thread::spawn(move || {
+            for i in 0..INSTERT_COUNT {
+                let string = format!("Key {}", i);
+                table_d.insert(&string, i);
+            }
+        });
+
+        a.join();
+        b.join();
+        c.join();
+        d.join();
+
+        println!("Done!! we have {} items ", jacktable.size());
+    }
 
     #[test]
     fn it_works() {
-        let mut jacktable = JackMap::new(200);
-        const INSTERT_COUNT: usize = 100_000;
+        let jacktable = JackMap::new(2000);
+        const INSTERT_COUNT: usize = 800_000;
 
         for i in 0..INSTERT_COUNT {
             let string = format!("Key {}", i);
             jacktable.insert(&string, i);
         }
-
         println!("JackTable size is {}", jacktable.size());
+        let mut cntr = 0;
 
         for i in 0..INSTERT_COUNT {
             let string = format!("Key {}", i);
 
-            let found = jacktable.get(&string).unwrap();
+            let found = jacktable.get(&string);
 
-            //assert_eq!(found, i);
+            if found.is_none() {
+                cntr += 1;
+            }
+
+            //assert_eq!(found.unwrap(), i);
         }
+
+        println!("We lost {} bits of data", cntr);
 
         println!("{:?}", jacktable.get(&"Key 0"));
         jacktable.insert(&"Key 0", 123456);

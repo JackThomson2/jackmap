@@ -1,17 +1,19 @@
-use flize::Atomic;
+use flize::{Atomic, Shared};
 
 pub struct LeafNode<V> {
     pub key: usize,
-    pub data: V,
-    pub next: Atomic<LeafNode<V>>,
+    pub data: Atomic<V>,
+    pub low: Atomic<LeafNode<V>>,
+    pub high: Atomic<LeafNode<V>>,
 }
 
 impl<V> LeafNode<V> {
     pub fn new(key: usize, data: V) -> Self {
         Self {
             key,
-            data,
-            next: Atomic::null(),
+            data: Atomic::new(unsafe { Shared::from_ptr(Box::into_raw(Box::new(data))) }),
+            low: Atomic::null(),
+            high: Atomic::null(),
         }
     }
 }
