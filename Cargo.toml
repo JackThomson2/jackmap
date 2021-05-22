@@ -7,4 +7,8 @@ edition = "2018"
 
 [dependencies]
 ahash = "0.7.3"
-flize = "4.2.3"
+flize = {git = "https://github.com/xacrimon/flize", branch = "acrimon/dgl"}
+
+
+[profile.release]
+debug = true

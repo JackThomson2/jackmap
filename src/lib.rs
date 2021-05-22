@@ -28,9 +28,10 @@ where
     V: Clone,
 {
     #[inline]
-    fn find_item<'g>(&self, key: usize, guard: &'g ThinShield) -> Option<Shared<'g, LeafNode<V>>> {
+    fn find_item<'g>(&self, key: usize) -> Option<Shared<'g, LeafNode<V>>> {
         unsafe {
-            let mut checking = self.head.load(Relaxed, guard);
+            let danger = flize::unprotected();
+            let mut checking = self.head.load(Relaxed, danger);
 
             loop {
                 if checking.is_null() {
@@ -43,9 +44,9 @@ where
                 }
 
                 checking = if leaf.key > key {
-                    leaf.low.load(Relaxed, guard)
+                    leaf.low.load(Relaxed, danger)
                 } else {
-                    leaf.high.load(Relaxed, guard)
+                    leaf.high.load(Relaxed, danger)
                 };
             }
         }
@@ -54,18 +55,21 @@ where
     #[inline]
     pub fn insert_item(&self, key: usize, value: V) -> bool {
         let shield = self.collector.thin_shield();
-
-        let new =
-            unsafe { Shared::from_ptr(Box::into_raw(Box::new(LeafNode::new(key, value.clone())))) };
-
         let data = unsafe { Shared::from_ptr(Box::into_raw(Box::new(value))) };
+        let mut item = None;
+
         'outer: loop {
             let head = self.head.load(Acquire, &shield);
 
             if head.is_null() {
+                if item.is_none() {
+                    item = Some(unsafe {
+                        Shared::from_ptr(Box::into_raw(Box::new(LeafNode::new(key, data))))
+                    });
+                }
                 match self
                     .head
-                    .compare_exchange(head, new, Acquire, Relaxed, &shield)
+                    .compare_exchange(head, item.unwrap(), Acquire, Relaxed, &shield)
                 {
                     Ok(_) => return true,
                     Err(_owned) => continue,
@@ -73,45 +77,69 @@ where
             }
 
             unsafe {
-                let mut above = head;
-                let mut checking = head;
+                let mut above = head.as_ref_unchecked();
+                let mut checking = above;
 
-                let mut low = above.as_ref_unchecked().key > key;
+                if checking.key == key {
+                    checking.data.store(data, Relaxed);
+                    return false;
+                }
+
+                let mut low = above.key > key;
+
+                let mut from_low = low;
+                let mut top_level = true;
 
                 loop {
-                    if checking.is_null() {
-                        let referencing = if low {
-                            &above.as_ref_unchecked().low
-                        } else {
-                            &above.as_ref_unchecked().high
-                        };
+                    let looking_at = if low { &checking.low } else { &checking.high };
+                    let looking_at_cell = looking_at.load(Relaxed, &shield);
 
-                        match referencing.compare_exchange(checking, new, Acquire, Relaxed, &shield)
-                        {
+                    if looking_at_cell.is_null() {
+                        if item.is_none() {
+                            item = Some(Shared::from_ptr(Box::into_raw(Box::new(LeafNode::new(
+                                key, data,
+                            )))));
+                        }
+
+                        match looking_at.compare_exchange(
+                            looking_at_cell,
+                            item.unwrap(),
+                            Acquire,
+                            Relaxed,
+                            &shield,
+                        ) {
                             Ok(_) => {
                                 return true;
                             }
                             Err(_) => {
-                                continue 'outer;
+                                // cowardly backout
+                                if top_level {
+                                    continue 'outer;
+                                }
+
+                                checking = if from_low {
+                                    above.low.load(Relaxed, &shield).as_ref_unchecked()
+                                } else {
+                                    above.high.load(Relaxed, &shield).as_ref_unchecked()
+                                };
+
+                                continue;
                             }
                         }
                     }
 
-                    let item = checking.as_mut_ref_unchecked();
+                    top_level = false;
+                    from_low = low;
 
-                    if item.key == key {
-                        item.data.store(data, SeqCst);
+                    above = checking;
+                    checking = looking_at_cell.as_ref_unchecked();
+
+                    if checking.key == key {
+                        checking.data.store(data, SeqCst);
                         return false;
                     }
 
-                    low = checking.as_ref_unchecked().key > key;
-
-                    above = checking;
-                    checking = if low {
-                        checking.as_ref_unchecked().low.load(Acquire, &shield)
-                    } else {
-                        checking.as_ref_unchecked().high.load(Acquire, &shield)
-                    };
+                    low = checking.key > key;
                 }
             }
         }
@@ -123,15 +151,8 @@ where
     }
 
     #[inline]
-    pub fn try_get<'a>(
-        &self,
-        key: usize,
-        shield: &'a ThinShield,
-    ) -> Option<Shared<'a, LeafNode<V>>> {
-        match self.find_item(key, shield) {
-            Some(index) => Some(index),
-            None => None,
-        }
+    pub fn try_get<'a>(&self, key: usize) -> Option<Shared<'a, LeafNode<V>>> {
+        self.find_item(key)
     }
 }
 
@@ -193,7 +214,6 @@ where
 
         unsafe {
             let res = self.buckets.get_unchecked(bucket).insert_item(key, value);
-
             if res {
                 self.size.fetch_add(1, Relaxed);
             }
@@ -206,22 +226,19 @@ where
     }
 
     #[inline]
-    pub fn get<K: 'a + Hash>(&self, key: &K) -> Option<V> {
+    pub fn get<K: 'a + Hash>(&self, key: &K) -> Option<&V> {
         let key = self.hash_key(key);
         let bucket = self.determine_bucket(key);
 
         let node = unsafe { self.buckets.get_unchecked(bucket) };
 
-        let shield = node.get_shield();
-
         unsafe {
-            match node.try_get(key, &shield) {
+            match node.try_get(key) {
                 Some(res) => Some(
                     res.as_ref_unchecked()
                         .data
-                        .load(Relaxed, &shield)
-                        .as_ref_unchecked()
-                        .clone(),
+                        .load(Relaxed, flize::unprotected())
+                        .as_ref_unchecked(),
                 ),
                 None => None,
             }
@@ -237,7 +254,7 @@ mod tests {
     #[test]
     fn threaded_test() {
         let jacktable = Arc::new(JackMap::new(200));
-        const INSTERT_COUNT: usize = 200;
+        const INSTERT_COUNT: usize = 2_000_000;
 
         let table_a = jacktable.clone();
         let a = thread::spawn(move || {
@@ -276,19 +293,12 @@ mod tests {
         c.join();
         d.join();
 
-        for i in 0..INSTERT_COUNT {
-            let string = format!("Key {}", i);
-            let a = jacktable.get(&string);
-
-            println!("We got {:?}", a);
-        }
-
         println!("Done!! we have {} items ", jacktable.size());
     }
 
     #[test]
     fn it_works() {
-        let jacktable = JackMap::new(2000);
+        let jacktable = JackMap::new(8);
         const INSTERT_COUNT: usize = 800_000;
 
         for i in 0..INSTERT_COUNT {
