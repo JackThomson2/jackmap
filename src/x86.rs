@@ -5,28 +5,32 @@ use core::arch::x86_64::_mm_tzcnt_32;
 use std::arch::x86_64::_mm256_set_epi64x;
 
 #[inline]
-pub unsafe fn find_index(f: &[usize], key: usize) -> Option<usize> {
+pub fn find_index(f: &[usize], key: usize) -> Option<usize> {
+    return f.iter().position(|&item| item == key);
+
     let mut index = 0;
-    let finder = _mm256_set1_epi64x(key as i64);
+    unsafe {
+        let finder = _mm256_set1_epi64x(key as i64);
 
-    while index + 4 < f.len() {
-        let loading = _mm256_set_epi64x(
-            f[index + 3] as i64,
-            f[index + 2] as i64,
-            f[index + 1] as i64,
-            f[index] as i64,
-        );
+        while index + 4 < f.len() {
+            let loading = _mm256_set_epi64x(
+                f[index + 3] as i64,
+                f[index + 2] as i64,
+                f[index + 1] as i64,
+                f[index] as i64,
+            );
 
-        let cmp = _mm256_cmpeq_epi64(loading, finder);
-        let mask = _mm256_movemask_epi8(cmp);
+            let cmp = _mm256_cmpeq_epi64(loading, finder);
+            let mask = _mm256_movemask_epi8(cmp);
 
-        let masked = _mm_tzcnt_32(mask as u32);
+            let masked = _mm_tzcnt_32(mask as u32);
 
-        if masked < 32 {
-            return Some(index + (masked / 8) as usize);
+            if masked < 32 {
+                return Some(index + (masked / 8) as usize);
+            }
+
+            index += 4;
         }
-
-        index += 4;
     }
 
     // Fall back to linear for the rest we can't spread

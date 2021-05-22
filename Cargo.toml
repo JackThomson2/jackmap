@@ -7,3 +7,4 @@ edition = "2018"
 
 [dependencies]
 ahash = "0.7.3"
+flize = "4.2.3"
