@@ -19,11 +19,6 @@ struct Bucket<V> {
 
 impl<V> Bucket<V> {
     #[inline]
-    fn find_index(&self, key: usize) -> Option<usize> {
-        self.keys.iter().position(|x| *x == key)
-    }
-
-    #[inline]
     pub fn insert_item(&mut self, key: usize, value: V) {
         unsafe {
             if let Some(found) = find_index(&self.keys, key) {
@@ -38,9 +33,11 @@ impl<V> Bucket<V> {
 
     #[inline]
     pub fn try_get(&self, key: usize) -> Option<&V> {
-        match self.find_index(key) {
-            Some(index) => Some(unsafe { self.values.get_unchecked(index) }),
-            None => None,
+        unsafe {
+            match find_index(&self.keys, key) {
+                Some(index) => Some(self.values.get_unchecked(index)),
+                None => None,
+            }
         }
     }
 }
@@ -156,7 +153,9 @@ mod tests {
         for i in 0..INSTERT_COUNT {
             let string = format!("Key {}", i);
 
-            assert_eq!(*jacktable.get(&string).unwrap(), i);
+            let found = jacktable.get(&string).unwrap();
+
+            assert_eq!(*found, i);
         }
     }
 }
