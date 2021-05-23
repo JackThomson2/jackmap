@@ -1,18 +1,18 @@
 #![feature(stdsimd)]
 
 use ahash::RandomState;
+use arrayvec::ArrayVec;
 use flize::{Atomic, Collector, NullTag, Shared, ThinShield};
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     sync::atomic::{
         AtomicUsize,
-        Ordering::{Acquire, Relaxed, SeqCst},
+        Ordering::{Acquire, Relaxed},
     },
     usize,
 };
 
 mod leaf;
-mod x86;
 
 use leaf::LeafNode;
 pub type DefaultHashBuilder = ahash::RandomState;
@@ -38,7 +38,7 @@ where
                     return None;
                 }
 
-                let leaf = checking.as_mut_ref_unchecked();
+                let leaf = checking.as_ref_unchecked();
                 if leaf.key == key {
                     return Some(checking);
                 }
@@ -54,12 +54,12 @@ where
 
     #[inline]
     pub fn insert_item(&self, key: usize, value: V) -> bool {
-        let shield = self.collector.thin_shield();
+        let shield = unsafe { flize::unprotected() };
         let data = unsafe { Shared::from_ptr(Box::into_raw(Box::new(value))) };
         let mut item = None;
 
         'outer: loop {
-            let head = self.head.load(Acquire, &shield);
+            let head = self.head.load(Acquire, shield);
 
             if head.is_null() {
                 if item.is_none() {
@@ -69,7 +69,7 @@ where
                 }
                 match self
                     .head
-                    .compare_exchange(head, item.unwrap(), Acquire, Relaxed, &shield)
+                    .compare_exchange(head, item.unwrap(), Acquire, Relaxed, shield)
                 {
                     Ok(_) => return true,
                     Err(_owned) => continue,
@@ -92,7 +92,7 @@ where
 
                 loop {
                     let looking_at = if low { &checking.low } else { &checking.high };
-                    let looking_at_cell = looking_at.load(Relaxed, &shield);
+                    let looking_at_cell = looking_at.load(Relaxed, shield);
 
                     if looking_at_cell.is_null() {
                         if item.is_none() {
@@ -106,7 +106,7 @@ where
                             item.unwrap(),
                             Acquire,
                             Relaxed,
-                            &shield,
+                            shield,
                         ) {
                             Ok(_) => {
                                 return true;
@@ -114,13 +114,14 @@ where
                             Err(_) => {
                                 // cowardly backout
                                 if top_level {
+                                    println!("we looped back");
                                     continue 'outer;
                                 }
 
                                 checking = if from_low {
-                                    above.low.load(Relaxed, &shield).as_ref_unchecked()
+                                    above.low.load(Relaxed, shield).as_ref_unchecked()
                                 } else {
-                                    above.high.load(Relaxed, &shield).as_ref_unchecked()
+                                    above.high.load(Relaxed, shield).as_ref_unchecked()
                                 };
 
                                 continue;
@@ -135,7 +136,7 @@ where
                     checking = looking_at_cell.as_ref_unchecked();
 
                     if checking.key == key {
-                        checking.data.store(data, SeqCst);
+                        checking.data.store(data, Relaxed);
                         return false;
                     }
 
@@ -161,8 +162,15 @@ where
 
 impl<V> Default for Bucket<V> {
     fn default() -> Self {
+        const MID_POINT: usize = usize::MAX / 2;
+
+        // Used to get a nice start point for the splitting
+        let item = unsafe {
+            Shared::from_ptr(Box::into_raw(Box::new(LeafNode::empty_with_key(MID_POINT))))
+        };
+
         Self {
-            head: Atomic::null(),
+            head: Atomic::new(item),
             collector: Collector::new(),
         }
     }
@@ -172,7 +180,7 @@ pub struct JackMap<V, S = DefaultHashBuilder> {
     size: AtomicUsize,
 
     num_buckets: usize,
-    buckets: Vec<Bucket<V>>,
+    buckets: ArrayVec<Bucket<V>, 1024>,
 
     hasher: S,
 }
@@ -182,10 +190,12 @@ where
     V: 'a + Clone,
 {
     pub fn new(num_buckets: usize) -> Self {
-        let mut buckets = Vec::with_capacity(num_buckets);
+        let mut buckets = ArrayVec::new();
 
-        for _i in 0..num_buckets {
-            buckets.push(Bucket::default())
+        unsafe {
+            for _i in 0..num_buckets {
+                buckets.push_unchecked(Bucket::default())
+            }
         }
 
         let hasher = RandomState::new();
@@ -203,7 +213,6 @@ where
         hash % self.num_buckets
     }
 
-    #[inline]
     fn hash_key<K: 'a + Hash>(&self, key: &K) -> usize {
         let mut hashing = self.hasher.build_hasher();
         key.hash(&mut hashing);
@@ -213,6 +222,18 @@ where
     #[inline]
     pub fn insert<K: 'a + Hash>(&self, key: &K, value: V) {
         let key = self.hash_key(key);
+        let bucket = self.determine_bucket(key);
+
+        unsafe {
+            let res = self.buckets.get_unchecked(bucket).insert_item(key, value);
+            if res {
+                self.size.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn insert_hashed(&self, key: usize, value: V) {
         let bucket = self.determine_bucket(key);
 
         unsafe {
@@ -237,12 +258,29 @@ where
 
         unsafe {
             match node.try_get(key) {
-                Some(res) => Some(
-                    res.as_ref_unchecked()
-                        .data
-                        .load(Relaxed, flize::unprotected())
-                        .as_ref_unchecked(),
-                ),
+                Some(res) => res
+                    .as_ref_unchecked()
+                    .data
+                    .load(Relaxed, flize::unprotected())
+                    .as_ref(),
+                None => None,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn get_hashed(&self, key: usize) -> Option<&V> {
+        let bucket = self.determine_bucket(key);
+
+        let node = unsafe { self.buckets.get_unchecked(bucket) };
+
+        unsafe {
+            match node.try_get(key) {
+                Some(res) => res
+                    .as_ref_unchecked()
+                    .data
+                    .load(Relaxed, flize::unprotected())
+                    .as_ref(),
                 None => None,
             }
         }
@@ -291,17 +329,17 @@ mod tests {
             }
         });
 
-        a.join();
-        b.join();
-        c.join();
-        d.join();
+        a.join().unwrap();
+        b.join().unwrap();
+        c.join().unwrap();
+        d.join().unwrap();
 
         println!("Done!! we have {} items ", jacktable.size());
     }
 
     #[test]
     fn it_works() {
-        let jacktable = JackMap::new(8);
+        let jacktable = JackMap::new(60);
         const INSTERT_COUNT: usize = 800_000;
 
         for i in 0..INSTERT_COUNT {

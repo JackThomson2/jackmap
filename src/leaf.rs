@@ -8,10 +8,20 @@ pub struct LeafNode<V> {
 }
 
 impl<V> LeafNode<V> {
+    #[inline]
     pub fn new(key: usize, data: Shared<V, NullTag, NullTag, 0, 0>) -> Self {
         Self {
             key,
             data: Atomic::new(data),
+            low: Atomic::null(),
+            high: Atomic::null(),
+        }
+    }
+
+    pub fn empty_with_key(key: usize) -> Self {
+        Self {
+            key,
+            data: Atomic::null(),
             low: Atomic::null(),
             high: Atomic::null(),
         }

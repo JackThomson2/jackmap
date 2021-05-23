@@ -7,6 +7,7 @@ edition = "2018"
 
 [dependencies]
 ahash = "0.7.3"
+arrayvec = "0.7.0"
 flize = {git = "https://github.com/xacrimon/flize", branch = "v5"}
 
 
