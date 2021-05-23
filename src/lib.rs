@@ -114,7 +114,6 @@ where
                             Err(_) => {
                                 // cowardly backout
                                 if top_level {
-                                    println!("we looped back");
                                     continue 'outer;
                                 }
 
