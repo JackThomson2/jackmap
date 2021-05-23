@@ -34,6 +34,10 @@ where
             for _i in 0..num_buckets {
                 buckets.push_unchecked(Bucket::default())
             }
+
+            for bucket in buckets.iter() {
+                bucket.pre_allocate_bucket(12);
+            }
         }
 
         let hasher = RandomState::new();
@@ -132,7 +136,7 @@ mod tests {
 
     #[test]
     fn threaded_test() {
-        let jacktable = Arc::new(JackMap::new(200));
+        let jacktable = Arc::new(JackMap::new(60));
         const INSTERT_COUNT: usize = 2_000_000;
 
         let table_a = jacktable.clone();

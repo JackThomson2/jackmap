@@ -1,7 +1,6 @@
 use crate::leaf::LeafNode;
 use flize::{Atomic, Collector, NullTag, Shared, ThinShield};
 use std::{
-    hash::Hasher,
     sync::atomic::Ordering::{Acquire, Relaxed},
     usize,
 };
@@ -15,6 +14,43 @@ impl<'b, V> Bucket<V>
 where
     V: Clone,
 {
+    unsafe fn pre_alloc_down(
+        depth: usize,
+        node: &Shared<LeafNode<V>, NullTag, NullTag, 0, 0>,
+    ) -> usize {
+        if depth == 0 {
+            // We're done here
+            return 0;
+        }
+
+        let left = Shared::from_ptr(Box::into_raw(Box::new(LeafNode::empty_with_key(
+            usize::MAX,
+        ))));
+
+        let right = Shared::from_ptr(Box::into_raw(Box::new(LeafNode::empty_with_key(
+            usize::MAX,
+        ))));
+
+        let reffed = node.as_mut_ref_unchecked();
+        reffed.low.store(left, Relaxed);
+        reffed.high.store(right, Relaxed);
+
+        let mut alloced = 2;
+
+        alloced +=
+            Bucket::pre_alloc_down(depth - 1, &reffed.low.load(Relaxed, flize::unprotected()));
+        alloced +=
+            Bucket::pre_alloc_down(depth - 1, &reffed.high.load(Relaxed, flize::unprotected()));
+
+        alloced
+    }
+
+    pub unsafe fn pre_allocate_bucket(&self, depth: usize) -> usize {
+        let head = self.head.load(Relaxed, flize::unprotected());
+
+        Bucket::pre_alloc_down(depth, &head)
+    }
+
     #[inline]
     pub fn find_item<'g>(
         &self,
@@ -31,6 +67,12 @@ where
 
                 let leaf = checking.as_ref_unchecked();
                 let leaf_key = leaf.key.load(Acquire);
+
+                // Stop searching in this case
+                if leaf_key == usize::MAX {
+                    return None;
+                }
+
                 if leaf_key == key {
                     return Some(checking);
                 }
@@ -75,6 +117,9 @@ where
                 let leaf_key = checking.key.load(Acquire);
                 if leaf_key == key {
                     checking.data.store(data, Relaxed);
+                    if item.is_some() {
+                        println!("we have some garbage oops");
+                    }
                     return false;
                 }
 
@@ -107,7 +152,11 @@ where
                             Err(_) => {
                                 // cowardly backout
                                 if top_level {
-                                    continue 'outer;
+                                    println!("we broke oops");
+
+                                    above = self.head.load(Acquire, shield).as_mut_ref_unchecked();
+                                    checking = above;
+                                    continue;
                                 }
 
                                 checking = if from_low {
@@ -136,6 +185,10 @@ where
                         {
                             Ok(_) => {
                                 checking.data.store(data, Relaxed);
+
+                                if item.is_some() {
+                                    println!("we have some garbage oops");
+                                }
                                 return true;
                             }
                             Err(current) => {
@@ -146,6 +199,9 @@ where
 
                     if leaf_key == key {
                         checking.data.store(data, Relaxed);
+                        if item.is_some() {
+                            println!("we have some garbage oops");
+                        }
                         return false;
                     }
 
