@@ -88,33 +88,32 @@ where
 
     #[inline]
     pub fn insert_item(&self, key: usize, value: V) -> bool {
-        let shield = unsafe { flize::unprotected() };
+        let shield = &self.collector.thin_shield();
         let data = unsafe { Shared::from_ptr(Box::into_raw(Box::new(value))) };
         let mut item = None;
 
-        'outer: loop {
+        loop {
             let head = self.head.load(Acquire, shield);
-
-            if head.is_null() {
-                if item.is_none() {
-                    item = Some(unsafe {
-                        Shared::from_ptr(Box::into_raw(Box::new(LeafNode::new(key, data))))
-                    });
-                }
-                match self
-                    .head
-                    .compare_exchange(head, item.unwrap(), Acquire, Relaxed, shield)
-                {
-                    Ok(_) => return true,
-                    Err(_owned) => continue,
-                }
-            }
 
             unsafe {
                 let mut above = head.as_ref_unchecked();
                 let mut checking = above;
 
                 let leaf_key = checking.key.load(Acquire);
+
+                if leaf_key == usize::MAX {
+                    if checking
+                        .key
+                        .compare_exchange(usize::MAX, key, Acquire, Relaxed)
+                        .is_ok()
+                    {
+                        checking.data.store(data, Relaxed);
+                        return true;
+                    }
+
+                    continue;
+                }
+
                 if leaf_key == key {
                     checking.data.store(data, Relaxed);
                     if item.is_some() {
@@ -147,6 +146,7 @@ where
                             shield,
                         ) {
                             Ok(_) => {
+                                println!("We're now shifting up");
                                 return true;
                             }
                             Err(_) => {
@@ -227,11 +227,11 @@ where
 
 impl<V> Default for Bucket<V> {
     fn default() -> Self {
-        const MID_POINT: usize = usize::MAX / 2;
-
         // Used to get a nice start point for the splitting
         let item = unsafe {
-            Shared::from_ptr(Box::into_raw(Box::new(LeafNode::empty_with_key(MID_POINT))))
+            Shared::from_ptr(Box::into_raw(Box::new(LeafNode::empty_with_key(
+                usize::MAX,
+            ))))
         };
 
         Self {

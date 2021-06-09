@@ -1,7 +1,6 @@
 #![feature(stdsimd)]
 
 use ahash::RandomState;
-use arrayvec::ArrayVec;
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     sync::atomic::{AtomicUsize, Ordering::Relaxed},
@@ -18,7 +17,7 @@ pub struct JackMap<V, S = DefaultHashBuilder> {
     size: AtomicUsize,
 
     num_buckets: usize,
-    buckets: ArrayVec<Bucket<V>, 1024>,
+    buckets: Vec<Bucket<V>>,
 
     hasher: S,
 }
@@ -28,16 +27,10 @@ where
     V: 'a + Clone,
 {
     pub fn new(num_buckets: usize) -> Self {
-        let mut buckets = ArrayVec::new();
+        let mut buckets = Vec::with_capacity(num_buckets);
 
-        unsafe {
-            for _i in 0..num_buckets {
-                buckets.push_unchecked(Bucket::default())
-            }
-
-            for bucket in buckets.iter() {
-                bucket.pre_allocate_bucket(12);
-            }
+        for _i in 0..num_buckets {
+            buckets.push(Bucket::default())
         }
 
         let hasher = RandomState::new();
@@ -136,7 +129,7 @@ mod tests {
 
     #[test]
     fn threaded_test() {
-        let jacktable = Arc::new(JackMap::new(60));
+        let jacktable = Arc::new(JackMap::new(2_000_000));
         const INSTERT_COUNT: usize = 2_000_000;
 
         let table_a = jacktable.clone();
@@ -181,7 +174,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let jacktable = JackMap::new(60);
+        let jacktable = JackMap::new(800_000);
         const INSTERT_COUNT: usize = 800_000;
 
         for i in 0..INSTERT_COUNT {
