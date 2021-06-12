@@ -148,6 +148,67 @@ where
     }
 
     #[inline]
+    pub fn remove<K: 'a + Hash, S: Shield<'a>>(&self, key: &K, shield: &'a S) -> Option<&'a V> {
+        let key = self.hash_key(key);
+        self.remove_hashed(key as u64, shield)
+    }
+
+    #[inline]
+    pub fn remove_hashed<S: Shield<'a>>(&self, key: u64, shield: &'a S) -> Option<&'a V> {
+        let mut bucket = self.determine_bucket(key as usize);
+        let h2 = h2(key);
+
+        'outer: loop {
+            let start = bucket * 16;
+            debug_assert!(start + 15 < self.capacity);
+
+            let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
+            let mut search_res = unsafe { find(h2, searched_bucket) };
+
+            while let Some(idx) = search_res.try_get_next() {
+                let search_pos = start + idx as usize;
+
+                let bucket = unsafe { self.buckets.get_unchecked(search_pos) };
+                let loaded = bucket.load(SeqCst, shield);
+
+                if unlikely(loaded.is_null()) {
+                    return None;
+                }
+
+                let data = unsafe { loaded.as_ref_unchecked() };
+
+                if likely(data.hash == key) {
+                    match bucket.compare_exchange_weak(
+                        loaded,
+                        Shared::null(),
+                        SeqCst,
+                        Relaxed,
+                        shield,
+                    ) {
+                        Ok(res) => {
+                            unsafe { self.lut.0.get_unchecked(idx).store(EMPTY, SeqCst) };
+                            self.size.fetch_sub(1, Relaxed);
+                            return Some(unsafe { &res.as_ref_unchecked().value });
+                        }
+                        Err(_err) => {
+                            continue 'outer;
+                        }
+                    }
+                }
+
+                search_res = search_res.remove_top_index()
+            }
+
+            if unsafe { any_free(searched_bucket) } {
+                return None;
+            }
+
+            bucket += 1;
+            bucket %= self.num_buckets;
+        }
+    }
+
+    #[inline]
     pub fn get<K: 'a + Hash, S: Shield<'a>>(&self, key: &K, shield: &'a S) -> Option<&'a V> {
         let key = self.hash_key(key);
         self.get_hashed(key as u64, shield)
@@ -287,7 +348,7 @@ mod tests {
 
     #[test]
     fn single_add() {
-        let jacktable = JackMap::new(500);
+        let jacktable = JackMap::new(10_000);
 
         for i in 0..500 {
             let string = format!("Key 1 {}", &i);
@@ -296,7 +357,7 @@ mod tests {
             jacktable.insert(&string, 500);
 
             let end = start.elapsed();
-            println!(", key {}, Inserting took {:#?}", string, end);
+            println!("Inserting took {:#?}", end);
         }
 
         for i in 0..500 {

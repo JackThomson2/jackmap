@@ -42,9 +42,4 @@ impl Bucket {
             Some(self.0.trailing_zeros() as usize)
         }
     }
-
-    #[inline]
-    pub fn get_next_index(self) -> u32 {
-        self.0.trailing_zeros()
-    }
 }
