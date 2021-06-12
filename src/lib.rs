@@ -262,38 +262,35 @@ mod tests {
 
     #[test]
     fn threaded_test() {
-        let jacktable = Arc::new(JackMap::new(10_000_000));
-        const INSTERT_COUNT: usize = 2_000_000;
+        let jacktable = Arc::new(JackMap::new(20_000_000));
+        const INSTERT_COUNT: usize = 25165824 / 4;
 
+        let start = Instant::now();
         let table_a = jacktable.clone();
         let a = thread::spawn(move || {
             for i in 0..INSTERT_COUNT {
-                let string = format!("Key {}", i);
-                table_a.insert(&string, "Thread A");
+                table_a.insert(&i, "Thread A");
             }
         });
 
         let table_b = jacktable.clone();
         let b = thread::spawn(move || {
             for i in (0..INSTERT_COUNT).rev() {
-                let string = format!("Key {}", i);
-                table_b.insert(&string, "Thread B");
+                table_b.insert(&i, "Thread B");
             }
         });
 
         let table_c = jacktable.clone();
         let c = thread::spawn(move || {
             for i in 0..INSTERT_COUNT {
-                let string = format!("Key {}", i);
-                table_c.insert(&string, "Thread C");
+                table_c.insert(&i, "Thread C");
             }
         });
 
         let table_d = jacktable.clone();
         let d = thread::spawn(move || {
             for i in (0..INSTERT_COUNT).rev() {
-                let string = format!("Key {}", i);
-                table_d.insert(&string, "Thread D");
+                table_d.insert(&i, "Thread D");
             }
         });
 
@@ -302,15 +299,51 @@ mod tests {
         c.join().unwrap();
         d.join().unwrap();
 
+        println!("Inserting took {:#?}", start.elapsed());
+
         let shield = jacktable.get_shield();
         for i in (0..INSTERT_COUNT).rev() {
-            let string = format!("Key {}", i);
-            let found = jacktable.get(&string, &shield);
+            let found = jacktable.get(&i, &shield);
 
             if found.is_none() {
-                println!("We lost {}", string);
+                println!("We lost {}", i);
             }
         }
+
+        println!("Done!! we have {} items ", jacktable.size());
+    }
+
+    #[test]
+    fn threaded_read() {
+        let jacktable = Arc::new(JackMap::new(25165824 * 4));
+        const INSTERT_COUNT: usize = 25165824 / 2;
+
+        for i in 0..INSTERT_COUNT {
+            jacktable.insert(&i, "Thread A");
+        }
+
+        let start = Instant::now();
+
+        let table_a = jacktable.clone();
+        let a = thread::spawn(move || {
+            let sheild = table_a.get_shield();
+            for i in 0..INSTERT_COUNT {
+                table_a.get(&i, &sheild);
+            }
+        });
+
+        let table_b = jacktable.clone();
+        let b = thread::spawn(move || {
+            let sheild = table_b.get_shield();
+            for i in 0..INSTERT_COUNT {
+                table_b.get(&i, &sheild);
+            }
+        });
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        println!("Reading took {:#?}", start.elapsed());
 
         println!("Done!! we have {} items ", jacktable.size());
     }
@@ -351,21 +384,18 @@ mod tests {
         let jacktable = JackMap::new(10_000);
 
         for i in 0..500 {
-            let string = format!("Key 1 {}", &i);
             let start = Instant::now();
-
-            jacktable.insert(&string, 500);
+            jacktable.insert(&i, 500);
 
             let end = start.elapsed();
             println!("Inserting took {:#?}", end);
         }
 
         for i in 0..500 {
-            let string = format!("Key 1 {}", &i);
             let start = Instant::now();
             let shield = jacktable.get_shield();
-            if jacktable.get(&string, &shield).is_none() {
-                println!("Error with {}", string)
+            if jacktable.get(&i, &shield).is_none() {
+                println!("Error with {}", i)
             }
 
             let end = start.elapsed();
