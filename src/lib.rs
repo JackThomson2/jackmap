@@ -253,6 +253,54 @@ where
             bucket %= self.num_buckets;
         }
     }
+
+    #[inline]
+    pub fn update<K: 'a + Hash>(&self, key: &K, value: V) -> bool {
+        let key = self.hash_key(key);
+        let shield = self.get_shield();
+        self.update_hashed(key as u64, value, &shield)
+    }
+
+    #[inline]
+    pub fn update_hashed<S: Shield<'a>>(&self, key: u64, value: V, shield: &'a S) -> bool {
+        let mut bucket = self.determine_bucket(key as usize);
+        let h2 = h2(key);
+
+        loop {
+            let start = bucket * 16;
+            debug_assert!(start + 15 < self.capacity);
+
+            let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
+            let mut search_res = unsafe { find(h2, searched_bucket) };
+
+            while let Some(idx) = search_res.try_get_next() {
+                let search_pos = start + idx as usize;
+
+                let bucket = unsafe { self.buckets.get_unchecked(search_pos) };
+                let loaded = bucket.load(SeqCst, shield);
+
+                if unlikely(loaded.is_null()) {
+                    return false;
+                }
+
+                let data = unsafe { loaded.as_mut_ref_unchecked() };
+
+                if likely(data.hash == key) {
+                    data.value = value;
+                    return true;
+                }
+
+                search_res = search_res.remove_top_index()
+            }
+
+            if unsafe { any_free(searched_bucket) } {
+                return false;
+            }
+
+            bucket += 1;
+            bucket %= self.num_buckets;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -377,6 +425,47 @@ mod tests {
         println!("{:?}", jacktable.get(&"Key 0", &shield));
         jacktable.insert(&"Key 0", 123456);
         println!("{:?}", jacktable.get(&"Key 0", &shield));
+    }
+
+    #[test]
+    fn update_test() {
+        let jacktable = JackMap::new(10_000);
+
+        for i in 0..500 {
+            let start = Instant::now();
+            jacktable.insert(&i, 500);
+
+            let end = start.elapsed();
+            println!("Inserting took {:#?}", end);
+        }
+
+        for i in 0..500 {
+            let start = Instant::now();
+            jacktable.update(&i, 600);
+
+            let end = start.elapsed();
+            println!("Update took {:#?}", end);
+        }
+
+        for i in 0..500 {
+            let start = Instant::now();
+            let shield = jacktable.get_shield();
+
+            let res = match jacktable.get(&i, &shield) {
+                Some(res) => res,
+                None => {
+                    println!("Error with {}", i);
+                    continue;
+                }
+            };
+
+            assert!(*res == 600);
+
+            let end = start.elapsed();
+            println!("Reading took {:#?}ns", end.as_nanos());
+        }
+
+        println!("We have {} items in ", jacktable.size());
     }
 
     #[test]
