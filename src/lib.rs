@@ -127,11 +127,6 @@ where
                 Ok(_res) => {
                     unsafe { self.lut.0.get_unchecked(idx).store(h2, Ordering::SeqCst) }
                     self.size.fetch_add(1, Relaxed);
-                    print!(
-                        "Inserted in bucket {}, initial was {}",
-                        idx / 16,
-                        bucket_idx
-                    );
                     return;
                 }
                 Err(_) => {
@@ -165,13 +160,10 @@ where
 
         loop {
             let start = bucket * 16;
-
             debug_assert!(start + 15 < self.capacity);
 
             let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
             let mut search_res = unsafe { find(h2, searched_bucket) };
-
-            let init_search = search_res;
 
             while let Some(idx) = search_res.try_get_next() {
                 let search_pos = start + idx as usize;
@@ -180,7 +172,6 @@ where
                 let loaded = bucket.load(SeqCst, shield);
 
                 if unlikely(loaded.is_null()) {
-                    println!("This shouldn't fire...");
                     return None;
                 }
 
