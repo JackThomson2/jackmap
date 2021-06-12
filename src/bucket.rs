@@ -1,6 +1,8 @@
 use std::arch::x86_64 as x86;
 use std::sync::atomic::AtomicU8;
 
+pub const EMPTY: u8 = 0b1000_0000;
+
 #[repr(align(16))]
 pub struct Padded<T>(pub T);
 
@@ -13,7 +15,7 @@ pub unsafe fn find(tail: u8, base: *mut u8) -> Bucket {
 
 pub unsafe fn any_free(base: *mut u8) -> bool {
     let a = x86::_mm_loadu_si128(base.cast());
-    let cmp = x86::_mm_cmpeq_epi8(a, x86::_mm_set1_epi8(0));
+    let cmp = x86::_mm_cmpeq_epi8(a, x86::_mm_set1_epi8(EMPTY as i8));
 
     (x86::_mm_movemask_epi8(cmp) as u16) != 0
 }

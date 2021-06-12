@@ -17,7 +17,7 @@ use value::Value;
 mod bucket;
 mod value;
 
-use bucket::{any_free, find, Padded};
+use bucket::{any_free, find, Padded, EMPTY};
 
 pub type DefaultHashBuilder = ahash::RandomState;
 
@@ -27,8 +27,8 @@ fn h1(hash: u64) -> u64 {
 }
 
 #[inline]
-fn h2(hash: u64) -> u64 {
-    hash & 0x7F
+fn h2(hash: u64) -> u8 {
+    (hash & 0x7F) as u8
 }
 
 pub struct JackMap<V, S = DefaultHashBuilder> {
@@ -51,7 +51,7 @@ where
         let buckets = Atomic::null_vec(capacity);
         let hasher = RandomState::new();
         let num_buckets = capacity / 16;
-        let lut = Padded((0..capacity).map(|_x| AtomicU8::new(0)).collect());
+        let lut = Padded((0..capacity).map(|_x| AtomicU8::new(EMPTY)).collect());
 
         Self {
             size: AtomicUsize::new(0),
@@ -66,6 +66,8 @@ where
 
     #[inline]
     unsafe fn load_bucket_ptr(&self, idx: usize) -> *mut u8 {
+        debug_assert!(idx + 15 < self.capacity);
+
         self.lut.0.get_unchecked(idx).load(Ordering::SeqCst);
         self.lut.0.get_unchecked(idx).as_mut_ptr()
     }
@@ -106,7 +108,7 @@ where
 
             if !loaded.is_null() {
                 let found = unsafe { loaded.as_ref_unchecked() };
-                if found.hash == key as u64 {
+                if unlikely(found.hash == key as u64) {
                     match bucket.compare_exchange_weak(loaded, data, SeqCst, Relaxed, shield) {
                         Ok(_) => return,
                         Err(_) => {
@@ -123,13 +125,13 @@ where
 
             match bucket.compare_exchange_weak(Shared::null(), data, SeqCst, Relaxed, shield) {
                 Ok(_res) => {
-                    unsafe {
-                        self.lut
-                            .0
-                            .get_unchecked(idx)
-                            .store(h2 as u8, Ordering::SeqCst)
-                    }
+                    unsafe { self.lut.0.get_unchecked(idx).store(h2, Ordering::SeqCst) }
                     self.size.fetch_add(1, Relaxed);
+                    print!(
+                        "Inserted in bucket {}, initial was {}",
+                        idx / 16,
+                        bucket_idx
+                    );
                     return;
                 }
                 Err(_) => {
@@ -159,13 +161,17 @@ where
     #[inline]
     pub fn get_hashed<S: Shield<'a>>(&self, key: u64, shield: &'a S) -> Option<&'a V> {
         let mut bucket = self.determine_bucket(key as usize);
-        let h2 = h2(key) as u8;
+        let h2 = h2(key);
 
         loop {
             let start = bucket * 16;
-            let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
 
+            debug_assert!(start + 15 < self.capacity);
+
+            let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
             let mut search_res = unsafe { find(h2, searched_bucket) };
+
+            let init_search = search_res;
 
             while let Some(idx) = search_res.try_get_next() {
                 let search_pos = start + idx as usize;
@@ -188,17 +194,6 @@ where
             }
 
             if unsafe { any_free(searched_bucket) } {
-                println!("We failed to find any in bucket {} h2 of {}", bucket, h2);
-
-                for i in 0..16 {
-                    let idx = (bucket * 16) + i;
-
-                    let id = unsafe { self.lut.0.get_unchecked(idx).load(Ordering::Acquire) };
-
-                    print!("{},", id);
-                }
-
-                println!();
                 return None;
             }
 
@@ -310,7 +305,7 @@ mod tests {
             jacktable.insert(&string, 500);
 
             let end = start.elapsed();
-            println!("Inserting took {:#?}", end);
+            println!(", key {}, Inserting took {:#?}", string, end);
         }
 
         for i in 0..500 {
