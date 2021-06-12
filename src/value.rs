@@ -19,3 +19,17 @@ impl<V> PartialEq for Value<V> {
         self.hash == other.hash
     }
 }
+
+impl<V> PartialEq<u64> for Value<V> {
+    #[inline]
+    fn eq(&self, other: &u64) -> bool {
+        self.hash == *other
+    }
+}
+
+impl<V> PartialEq<u64> for &Value<V> {
+    #[inline]
+    fn eq(&self, other: &u64) -> bool {
+        self.hash == *other
+    }
+}
