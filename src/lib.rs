@@ -483,6 +483,8 @@ mod tests {
             }
         }
 
+        assert!(jacktable.size() == INSTERT_COUNT);
+
         println!("Done!! we have {} items ", jacktable.size());
     }
 
