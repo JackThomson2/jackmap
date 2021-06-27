@@ -166,8 +166,6 @@ where
 
     #[inline]
     pub fn insert_hashed<'b, S: Shield<'b>>(&self, key: usize, value: V, shield: &'b S) {
-        let num_buckets = self.num_buckets.load(Relaxed);
-        let bucket_idx = self.determine_bucket(key, num_buckets);
         let h2 = h2(key as u64);
 
         let data = value::Value::new_boxed(key as u64, value);
@@ -175,6 +173,8 @@ where
         let buckets = self.buckets.read();
         let lut = self.lut.read();
 
+        let num_buckets = self.num_buckets.load(Relaxed);
+        let bucket_idx = self.determine_bucket(key, num_buckets);
         let mut bucket = bucket_idx;
 
         'outer: loop {
@@ -189,13 +189,12 @@ where
                 let found_bucket = unsafe { buckets.get_unchecked(search_pos) };
                 let loaded = found_bucket.load(SeqCst, shield);
 
-                if !loaded.is_null() {
-                    let found = unsafe { loaded.as_ref_unchecked() };
+                if let Some(found) = unsafe { loaded.as_ref() } {
                     if likely(found.hash == key as u64) {
-                        match found_bucket
-                            .compare_exchange_weak(loaded, data, SeqCst, Relaxed, shield)
-                        {
-                            Ok(_) => return,
+                        match found_bucket.compare_exchange(loaded, data, SeqCst, Relaxed, shield) {
+                            Ok(_) => {
+                                return;
+                            }
                             Err(_) => {
                                 continue 'outer;
                             }
