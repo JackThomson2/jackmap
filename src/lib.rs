@@ -191,13 +191,12 @@ where
 
                 if !loaded.is_null() {
                     let found = unsafe { loaded.as_ref_unchecked() };
-                    if found.hash == key as u64 {
+                    if likely(found.hash == key as u64) {
                         match found_bucket
                             .compare_exchange_weak(loaded, data, SeqCst, Relaxed, shield)
                         {
                             Ok(_) => return,
                             Err(_) => {
-                                bucket = bucket_idx;
                                 continue 'outer;
                             }
                         }
@@ -230,7 +229,6 @@ where
                         return;
                     }
                     Err(_) => {
-                        bucket = bucket_idx;
                         continue 'outer;
                     }
                 }
@@ -530,7 +528,7 @@ mod tests {
 
         for i in 0..INSTERT_COUNT {
             let string = format!("Key {}", i);
-            jacktable.insert(&string, i);
+            jacktable.insert(&string, i + 1);
         }
         println!("JackTable size is {}", jacktable.size());
         let mut cntr = 0;
