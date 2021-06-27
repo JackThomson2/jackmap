@@ -106,7 +106,7 @@ where
         self.insert_hashed(key, value, &shield);
     }
 
-    unsafe fn resize(&self) {
+    pub unsafe fn resize(&self) {
         if self.state.load(Ordering::SeqCst) == RESIZING {
             while self.state.load(Ordering::SeqCst) == RESIZING {
                 spin_loop();
@@ -203,7 +203,17 @@ where
             match bucket.compare_exchange_weak(Shared::null(), data, SeqCst, Relaxed, shield) {
                 Ok(_res) => {
                     unsafe { lut.0.get_unchecked(idx).store(h2, Ordering::SeqCst) }
-                    self.size.fetch_add(1, Relaxed);
+                    let new_size = self.size.fetch_add(1, Relaxed);
+
+                    if ((idx / 16) != bucket_idx) || (new_size + 1 >= self.capacity()) {
+                        drop(buckets);
+                        drop(lut);
+
+                        unsafe {
+                            self.resize();
+                        }
+                    }
+
                     return;
                 }
                 Err(_) => {
@@ -222,6 +232,11 @@ where
     #[inline]
     pub fn size(&self) -> usize {
         self.size.load(Relaxed)
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity.load(Relaxed)
     }
 
     #[inline]
@@ -587,5 +602,95 @@ mod tests {
         }
 
         println!("We have {} items in ", jacktable.size());
+    }
+
+    #[test]
+    fn resize() {
+        let jacktable: JackMap<u64> = JackMap::new(10_000);
+
+        let start = jacktable.capacity();
+
+        unsafe {
+            jacktable.resize();
+        }
+
+        let end = jacktable.capacity();
+
+        println!("Started as {} ended as {} ", start, end);
+    }
+
+    #[test]
+    fn auto_resize() {
+        let jacktable: JackMap<u64> = JackMap::new(10);
+        let start = jacktable.capacity();
+
+        println!("initial capacity... {}", start);
+
+        for i in 0..100 {
+            jacktable.insert(&i, i);
+        }
+
+        let end = jacktable.capacity();
+
+        println!("Started as {} ended as {} ", start, end);
+
+        assert!(end >= 100);
+    }
+
+    #[test]
+    fn threaded_resize_test() {
+        let jacktable = Arc::new(JackMap::new(100));
+        const INSTERT_COUNT: usize = 100_000;
+
+        let start = Instant::now();
+        let table_a = jacktable.clone();
+        let a = thread::spawn(move || {
+            for i in 0..INSTERT_COUNT {
+                table_a.insert(&i, "Thread A");
+            }
+        });
+
+        let table_b = jacktable.clone();
+        let b = thread::spawn(move || {
+            for i in (0..INSTERT_COUNT).rev() {
+                table_b.insert(&i, "Thread B");
+            }
+        });
+
+        let table_c = jacktable.clone();
+        let c = thread::spawn(move || {
+            for i in 0..INSTERT_COUNT {
+                table_c.insert(&i, "Thread C");
+            }
+        });
+
+        let table_d = jacktable.clone();
+        let d = thread::spawn(move || {
+            for i in (0..INSTERT_COUNT).rev() {
+                table_d.insert(&i, "Thread D");
+            }
+        });
+
+        a.join().unwrap();
+        b.join().unwrap();
+        c.join().unwrap();
+        d.join().unwrap();
+
+        println!("Inserting took {:#?}", start.elapsed());
+
+        let shield = jacktable.get_shield();
+        for i in (0..INSTERT_COUNT).rev() {
+            let found = jacktable.get(&i, &shield);
+
+            if found.is_none() {
+                println!("We lost {}", i);
+            }
+        }
+
+        println!(
+            "Done!! we have {} items end capacity {}",
+            jacktable.size(),
+            jacktable.capacity()
+        );
     }
 }
