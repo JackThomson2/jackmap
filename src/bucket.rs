@@ -6,6 +6,7 @@ pub const EMPTY: u8 = 0b1000_0000;
 #[repr(align(16))]
 pub struct Padded<T>(pub T);
 
+#[inline]
 pub unsafe fn find(tail: u8, base: *mut u8) -> Bucket {
     let a = x86::_mm_load_si128(base.cast());
     let cmp = x86::_mm_cmpeq_epi8(a, x86::_mm_set1_epi8(tail as i8));
@@ -13,11 +14,29 @@ pub unsafe fn find(tail: u8, base: *mut u8) -> Bucket {
     Bucket(x86::_mm_movemask_epi8(cmp) as u16)
 }
 
-pub unsafe fn any_free(base: *mut u8) -> bool {
+#[inline]
+pub unsafe fn find_free(base: *mut u8) -> Bucket {
     let a = x86::_mm_load_si128(base.cast());
     let cmp = x86::_mm_cmpeq_epi8(a, x86::_mm_set1_epi8(EMPTY as i8));
 
-    (x86::_mm_movemask_epi8(cmp) as u16) != 0
+    Bucket(x86::_mm_movemask_epi8(cmp) as u16)
+}
+
+#[inline]
+pub unsafe fn find_and_free(tail: u8, base: *mut u8) -> Bucket {
+    let a = x86::_mm_load_si128(base.cast());
+
+    let cmp = x86::_mm_cmpeq_epi8(a, x86::_mm_set1_epi8(tail as i8));
+    let cmp_empty = x86::_mm_cmpeq_epi8(a, x86::_mm_set1_epi8(EMPTY as i8));
+
+    let res = (x86::_mm_movemask_epi8(cmp) as u16) | (x86::_mm_movemask_epi8(cmp_empty) as u16);
+
+    Bucket(res)
+}
+
+#[inline]
+pub unsafe fn any_free(base: *mut u8) -> bool {
+    !find_free(base).empty()
 }
 
 #[derive(Clone, Copy)]

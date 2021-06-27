@@ -19,7 +19,7 @@ use value::Value;
 mod bucket;
 mod value;
 
-use bucket::{any_free, find, Padded, EMPTY};
+use bucket::{any_free, find, find_and_free, Padded, EMPTY};
 
 pub type DefaultHashBuilder = ahash::RandomState;
 
@@ -166,10 +166,8 @@ where
 
     #[inline]
     pub fn insert_hashed<'b, S: Shield<'b>>(&self, key: usize, value: V, shield: &'b S) {
-        let bucket_idx = self.determine_bucket(key, self.num_buckets.load(Relaxed));
-
-        let start = bucket_idx * 16;
-        let mut idx = start;
+        let num_buckets = self.num_buckets.load(Relaxed);
+        let bucket_idx = self.determine_bucket(key, num_buckets);
         let h2 = h2(key as u64);
 
         let data = value::Value::new_boxed(key as u64, value);
@@ -177,50 +175,69 @@ where
         let buckets = self.buckets.read();
         let lut = self.lut.read();
 
-        let capacity = self.capacity.load(Relaxed);
+        let mut bucket = bucket_idx;
 
-        loop {
-            let bucket = unsafe { buckets.get_unchecked(idx) };
-            let loaded = bucket.load(SeqCst, shield);
+        'outer: loop {
+            let start = bucket * 16;
 
-            if !loaded.is_null() {
-                let found = unsafe { loaded.as_ref_unchecked() };
-                if unlikely(found.hash == key as u64) {
-                    match bucket.compare_exchange_weak(loaded, data, SeqCst, Relaxed, shield) {
-                        Ok(_) => return,
-                        Err(_) => {
-                            idx = start;
-                            continue;
-                        }
-                    }
-                }
+            let searched_bucket = unsafe { self.load_bucket_ptr(&lut, start) };
+            let mut search_res = unsafe { find_and_free(h2, searched_bucket) };
 
-                idx += 1;
-                idx %= capacity;
-                continue;
-            }
+            while let Some(idx) = search_res.try_get_next() {
+                let search_pos = start + idx as usize;
 
-            match bucket.compare_exchange_weak(Shared::null(), data, SeqCst, Relaxed, shield) {
-                Ok(_res) => {
-                    unsafe { lut.0.get_unchecked(idx).store(h2, Ordering::SeqCst) }
-                    let new_size = self.size.fetch_add(1, Relaxed);
+                let found_bucket = unsafe { buckets.get_unchecked(search_pos) };
+                let loaded = found_bucket.load(SeqCst, shield);
 
-                    if ((idx / 16) != bucket_idx) || (new_size + 1 >= self.capacity()) {
-                        drop(buckets);
-                        drop(lut);
-
-                        unsafe {
-                            self.resize();
+                if !loaded.is_null() {
+                    let found = unsafe { loaded.as_ref_unchecked() };
+                    if found.hash == key as u64 {
+                        match found_bucket
+                            .compare_exchange_weak(loaded, data, SeqCst, Relaxed, shield)
+                        {
+                            Ok(_) => return,
+                            Err(_) => {
+                                bucket = bucket_idx;
+                                continue 'outer;
+                            }
                         }
                     }
 
-                    return;
-                }
-                Err(_) => {
-                    idx = start;
+                    search_res = search_res.remove_top_index();
                     continue;
                 }
+
+                match found_bucket.compare_exchange_weak(
+                    Shared::null(),
+                    data,
+                    SeqCst,
+                    Relaxed,
+                    shield,
+                ) {
+                    Ok(_res) => {
+                        unsafe { lut.0.get_unchecked(search_pos).store(h2, Ordering::SeqCst) }
+                        let new_size = self.size.fetch_add(1, Relaxed);
+
+                        if unlikely((bucket != bucket_idx) || (new_size + 1 >= self.capacity())) {
+                            drop(buckets);
+                            drop(lut);
+
+                            unsafe {
+                                self.resize();
+                            }
+                        }
+
+                        return;
+                    }
+                    Err(_) => {
+                        bucket = bucket_idx;
+                        continue 'outer;
+                    }
+                }
             }
+
+            bucket += 1;
+            bucket %= num_buckets;
         }
     }
 
@@ -380,7 +397,7 @@ where
             let start = bucket * 16;
             debug_assert!(start + 15 < capacity);
 
-            let searched_bucket = unsafe { self.load_bucket_ptr(&lut, bucket * 16) };
+            let searched_bucket = unsafe { self.load_bucket_ptr(&lut, start) };
             let mut search_res = unsafe { find(h2, searched_bucket) };
 
             while let Some(idx) = search_res.try_get_next() {
@@ -639,8 +656,8 @@ mod tests {
 
     #[test]
     fn threaded_resize_test() {
-        let jacktable = Arc::new(JackMap::new(100));
-        const INSTERT_COUNT: usize = 100_000;
+        let jacktable = Arc::new(JackMap::new(10));
+        const INSTERT_COUNT: usize = 1_000_000;
 
         let start = Instant::now();
         let table_a = jacktable.clone();
