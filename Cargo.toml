@@ -9,6 +9,7 @@ edition = "2018"
 ahash = "0.7.3"
 arrayvec = "0.7.0"
 flize = {git = "https://github.com/xacrimon/flize", branch = "v5"}
+parking_lot = "0.11.1"
 
 
 [profile.release]

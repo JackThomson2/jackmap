@@ -3,8 +3,10 @@
 
 use ahash::RandomState;
 use flize::{Atomic, Collector, NullTag, Shared, Shield, ThinShield};
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::{
     hash::{BuildHasher, Hash, Hasher},
+    hint::spin_loop,
     intrinsics::{likely, unlikely},
     sync::atomic::{
         AtomicU8, AtomicUsize,
@@ -21,6 +23,8 @@ use bucket::{any_free, find, Padded, EMPTY};
 
 pub type DefaultHashBuilder = ahash::RandomState;
 
+const RESIZING: u8 = 0b0001;
+
 #[inline]
 fn h1(hash: u64) -> u64 {
     hash >> 7
@@ -33,13 +37,15 @@ fn h2(hash: u64) -> u8 {
 
 pub struct JackMap<V, S = DefaultHashBuilder> {
     size: AtomicUsize,
-    capacity: usize,
-    num_buckets: usize,
-    buckets: Vec<Atomic<Value<V>, NullTag, NullTag, 0, 0>>,
+    capacity: AtomicUsize,
+    num_buckets: AtomicUsize,
+    buckets: RwLock<Vec<Atomic<Value<V>, NullTag, NullTag, 0, 0>>>,
 
     hasher: S,
     collector: Collector,
-    lut: Padded<Vec<AtomicU8>>,
+    lut: RwLock<Padded<Vec<AtomicU8>>>,
+
+    state: AtomicU8,
 }
 
 impl<'a, V> JackMap<V, DefaultHashBuilder>
@@ -48,33 +54,41 @@ where
 {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.next_power_of_two();
-        let buckets = Atomic::null_vec(capacity);
+        let buckets = RwLock::new(Atomic::null_vec(capacity));
         let hasher = RandomState::new();
-        let num_buckets = capacity / 16;
-        let lut = Padded((0..capacity).map(|_x| AtomicU8::new(EMPTY)).collect());
+        let num_buckets = AtomicUsize::new(capacity / 16);
+        let lut = RwLock::new(Padded(
+            (0..capacity).map(|_x| AtomicU8::new(EMPTY)).collect(),
+        ));
+        let state = AtomicU8::new(0);
 
         Self {
             size: AtomicUsize::new(0),
-            capacity,
+            capacity: AtomicUsize::new(capacity),
             num_buckets,
             buckets,
             hasher,
             collector: Collector::new(),
             lut,
+            state,
         }
     }
 
     #[inline]
-    unsafe fn load_bucket_ptr(&self, idx: usize) -> *mut u8 {
-        debug_assert!(idx + 15 < self.capacity);
+    unsafe fn load_bucket_ptr(
+        &self,
+        lut: &RwLockReadGuard<Padded<Vec<AtomicU8>>>,
+        idx: usize,
+    ) -> *mut u8 {
+        debug_assert!(idx + 15 < self.capacity.load(Relaxed));
 
-        self.lut.0.get_unchecked(idx).load(Ordering::SeqCst);
-        self.lut.0.get_unchecked(idx).as_mut_ptr()
+        lut.0.get_unchecked(idx).load(Ordering::SeqCst);
+        lut.0.get_unchecked(idx).as_mut_ptr()
     }
 
     #[inline]
-    fn determine_bucket(&self, hash: usize) -> usize {
-        h1(hash as u64) as usize % self.num_buckets
+    fn determine_bucket(&self, hash: usize, num_buckets: usize) -> usize {
+        h1(hash as u64) as usize % num_buckets
     }
 
     #[inline]
@@ -92,9 +106,67 @@ where
         self.insert_hashed(key, value, &shield);
     }
 
+    unsafe fn resize(&self) {
+        if self.state.load(Ordering::SeqCst) == RESIZING {
+            while self.state.load(Ordering::SeqCst) == RESIZING {
+                spin_loop();
+            }
+
+            return;
+        }
+
+        if let Err(_res) = self
+            .state
+            .compare_exchange_weak(0, RESIZING, SeqCst, Relaxed)
+        {
+            self.resize();
+            return;
+        }
+
+        let mut buckets = self.buckets.write();
+        let mut lut = self.lut.write();
+
+        let capacity = (self.capacity.load(Relaxed) * 2).next_power_of_two();
+        let new_buckets = Atomic::null_vec(capacity);
+        let num_buckets = capacity / 16;
+        let new_lut: Padded<Vec<AtomicU8>> =
+            Padded((0..capacity).map(|_x| AtomicU8::new(EMPTY)).collect());
+
+        let shield = self.get_shield();
+
+        for (idx, item) in buckets.iter().enumerate() {
+            let shared_type = item.load(Ordering::Relaxed, &shield);
+            if let Some(item) = shared_type.as_ref() {
+                let bucket = h1(item.hash) as usize % num_buckets;
+                let mut search = bucket * 16;
+                loop {
+                    let pos = new_buckets.get_unchecked(search);
+                    if pos.load(Ordering::Relaxed, &shield).is_null() {
+                        pos.store(shared_type, Relaxed);
+                        new_lut
+                            .0
+                            .get_unchecked(search)
+                            .store(lut.0.get_unchecked(idx).load(Relaxed), Relaxed);
+                        break;
+                    }
+
+                    search += 1;
+                    search %= capacity;
+                }
+            }
+        }
+
+        *buckets = new_buckets;
+        *lut = new_lut;
+        self.num_buckets.store(num_buckets, SeqCst);
+        self.capacity.store(capacity, SeqCst);
+
+        self.state.store(0, SeqCst);
+    }
+
     #[inline]
     pub fn insert_hashed<'b, S: Shield<'b>>(&self, key: usize, value: V, shield: &'b S) {
-        let bucket_idx = self.determine_bucket(key);
+        let bucket_idx = self.determine_bucket(key, self.num_buckets.load(Relaxed));
 
         let start = bucket_idx * 16;
         let mut idx = start;
@@ -102,8 +174,13 @@ where
 
         let data = value::Value::new_boxed(key as u64, value);
 
+        let buckets = self.buckets.read();
+        let lut = self.lut.read();
+
+        let capacity = self.capacity.load(Relaxed);
+
         loop {
-            let bucket = unsafe { self.buckets.get_unchecked(idx) };
+            let bucket = unsafe { buckets.get_unchecked(idx) };
             let loaded = bucket.load(SeqCst, shield);
 
             if !loaded.is_null() {
@@ -119,13 +196,13 @@ where
                 }
 
                 idx += 1;
-                idx %= self.capacity;
+                idx %= capacity;
                 continue;
             }
 
             match bucket.compare_exchange_weak(Shared::null(), data, SeqCst, Relaxed, shield) {
                 Ok(_res) => {
-                    unsafe { self.lut.0.get_unchecked(idx).store(h2, Ordering::SeqCst) }
+                    unsafe { lut.0.get_unchecked(idx).store(h2, Ordering::SeqCst) }
                     self.size.fetch_add(1, Relaxed);
                     return;
                 }
@@ -155,20 +232,26 @@ where
 
     #[inline]
     pub fn remove_hashed<S: Shield<'a>>(&self, key: u64, shield: &'a S) -> Option<&'a V> {
-        let mut bucket = self.determine_bucket(key as usize);
         let h2 = h2(key);
+
+        let buckets = self.buckets.read();
+        let lut = self.lut.read();
+
+        let capacity = self.capacity.load(Relaxed);
+        let num_buckets = self.num_buckets.load(Relaxed);
+        let mut bucket = self.determine_bucket(key as usize, num_buckets);
 
         'outer: loop {
             let start = bucket * 16;
-            debug_assert!(start + 15 < self.capacity);
+            debug_assert!(start + 15 < capacity);
 
-            let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
+            let searched_bucket = unsafe { self.load_bucket_ptr(&lut, bucket * 16) };
             let mut search_res = unsafe { find(h2, searched_bucket) };
 
             while let Some(idx) = search_res.try_get_next() {
                 let search_pos = start + idx as usize;
 
-                let bucket = unsafe { self.buckets.get_unchecked(search_pos) };
+                let bucket = unsafe { buckets.get_unchecked(search_pos) };
                 let loaded = bucket.load(SeqCst, shield);
 
                 if unlikely(loaded.is_null()) {
@@ -186,7 +269,7 @@ where
                         shield,
                     ) {
                         Ok(res) => {
-                            unsafe { self.lut.0.get_unchecked(idx).store(EMPTY, SeqCst) };
+                            unsafe { lut.0.get_unchecked(idx).store(EMPTY, SeqCst) };
                             self.size.fetch_sub(1, Relaxed);
                             return Some(unsafe { &res.as_ref_unchecked().value });
                         }
@@ -204,7 +287,7 @@ where
             }
 
             bucket += 1;
-            bucket %= self.num_buckets;
+            bucket %= num_buckets;
         }
     }
 
@@ -216,20 +299,26 @@ where
 
     #[inline]
     pub fn get_hashed<S: Shield<'a>>(&self, key: u64, shield: &'a S) -> Option<&'a V> {
-        let mut bucket = self.determine_bucket(key as usize);
         let h2 = h2(key);
+
+        let buckets = self.buckets.read();
+        let lut = self.lut.read();
+
+        let capacity = self.capacity.load(Relaxed);
+        let num_buckets = self.num_buckets.load(Relaxed);
+        let mut bucket = self.determine_bucket(key as usize, num_buckets);
 
         loop {
             let start = bucket * 16;
-            debug_assert!(start + 15 < self.capacity);
+            debug_assert!(start + 15 < capacity);
 
-            let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
+            let searched_bucket = unsafe { self.load_bucket_ptr(&lut, bucket * 16) };
             let mut search_res = unsafe { find(h2, searched_bucket) };
 
             while let Some(idx) = search_res.try_get_next() {
                 let search_pos = start + idx as usize;
 
-                let bucket = unsafe { self.buckets.get_unchecked(search_pos) };
+                let bucket = unsafe { buckets.get_unchecked(search_pos) };
                 let loaded = bucket.load(SeqCst, shield);
 
                 if unlikely(loaded.is_null()) {
@@ -250,7 +339,7 @@ where
             }
 
             bucket += 1;
-            bucket %= self.num_buckets;
+            bucket %= num_buckets;
         }
     }
 
@@ -263,20 +352,26 @@ where
 
     #[inline]
     pub fn update_hashed<S: Shield<'a>>(&self, key: u64, value: V, shield: &'a S) -> bool {
-        let mut bucket = self.determine_bucket(key as usize);
         let h2 = h2(key);
+
+        let buckets = self.buckets.read();
+        let lut = self.lut.read();
+
+        let capacity = self.capacity.load(Relaxed);
+        let num_buckets = self.num_buckets.load(Relaxed);
+        let mut bucket = self.determine_bucket(key as usize, num_buckets);
 
         loop {
             let start = bucket * 16;
-            debug_assert!(start + 15 < self.capacity);
+            debug_assert!(start + 15 < capacity);
 
-            let searched_bucket = unsafe { self.load_bucket_ptr(bucket * 16) };
+            let searched_bucket = unsafe { self.load_bucket_ptr(&lut, bucket * 16) };
             let mut search_res = unsafe { find(h2, searched_bucket) };
 
             while let Some(idx) = search_res.try_get_next() {
                 let search_pos = start + idx as usize;
 
-                let bucket = unsafe { self.buckets.get_unchecked(search_pos) };
+                let bucket = unsafe { buckets.get_unchecked(search_pos) };
                 let loaded = bucket.load(SeqCst, shield);
 
                 if unlikely(loaded.is_null()) {
@@ -298,7 +393,7 @@ where
             }
 
             bucket += 1;
-            bucket %= self.num_buckets;
+            bucket %= num_buckets;
         }
     }
 }
