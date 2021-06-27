@@ -115,10 +115,7 @@ where
             return;
         }
 
-        if let Err(_res) = self
-            .state
-            .compare_exchange_weak(0, RESIZING, SeqCst, Relaxed)
-        {
+        if let Err(_res) = self.state.compare_exchange(0, RESIZING, SeqCst, Relaxed) {
             self.resize();
             return;
         }
@@ -166,10 +163,6 @@ where
 
     #[inline]
     pub fn insert_hashed<'b, S: Shield<'b>>(&self, key: usize, value: V, shield: &'b S) {
-        let bucket_idx = self.determine_bucket(key, self.num_buckets.load(Relaxed));
-
-        let start = bucket_idx * 16;
-        let mut idx = start;
         let h2 = h2(key as u64);
 
         let data = value::Value::new_boxed(key as u64, value);
@@ -177,7 +170,11 @@ where
         let buckets = self.buckets.read();
         let lut = self.lut.read();
 
-        let capacity = self.capacity.load(Relaxed);
+        let bucket_idx = self.determine_bucket(key, self.num_buckets.load(SeqCst));
+        let capacity = self.capacity.load(SeqCst);
+
+        let start = bucket_idx * 16;
+        let mut idx = start;
 
         loop {
             let bucket = unsafe { buckets.get_unchecked(idx) };
@@ -203,7 +200,7 @@ where
             match bucket.compare_exchange_weak(Shared::null(), data, SeqCst, Relaxed, shield) {
                 Ok(_res) => {
                     unsafe { lut.0.get_unchecked(idx).store(h2, Ordering::SeqCst) }
-                    let new_size = self.size.fetch_add(1, Relaxed);
+                    let new_size = self.size.fetch_add(1, SeqCst);
 
                     if ((idx / 16) != bucket_idx) || (new_size + 1 >= self.capacity()) {
                         drop(buckets);
@@ -686,6 +683,8 @@ mod tests {
                 println!("We lost {}", i);
             }
         }
+
+        assert_eq!(jacktable.size(), INSTERT_COUNT);
 
         println!(
             "Done!! we have {} items end capacity {}",
