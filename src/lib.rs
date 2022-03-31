@@ -92,6 +92,11 @@ where
     }
 
     #[inline]
+    fn determine_bucket_mask(&self, hash: usize, num_buckets_mask: usize) -> usize {
+        h1(hash as u64) as usize & num_buckets_mask
+    }
+
+    #[inline]
     pub fn hash_key<K: 'a + Hash>(&self, key: &K) -> usize {
         let mut hashing = self.hasher.build_hasher();
         key.hash(&mut hashing);
@@ -124,6 +129,7 @@ where
         let mut lut = self.lut.write();
 
         let capacity = (self.capacity.load(Relaxed) * 2).next_power_of_two();
+        let capacity_mask = capacity - 1;
         let new_buckets = Atomic::null_vec(capacity);
         let num_buckets = capacity / 16;
         let new_lut: Padded<Vec<AtomicU8>> =
@@ -134,7 +140,7 @@ where
         for (idx, item) in buckets.iter().enumerate() {
             let shared_type = item.load(Ordering::Relaxed, &shield);
             if let Some(item) = shared_type.as_ref() {
-                let bucket = h1(item.hash) as usize % num_buckets;
+                let bucket = h1(item.hash) as usize & num_buckets - 1;
                 let mut search = bucket * 16;
                 loop {
                     let pos = new_buckets.get_unchecked(search);
@@ -148,7 +154,7 @@ where
                     }
 
                     search += 1;
-                    search %= capacity;
+                    search &= capacity_mask;
                 }
             }
         }
@@ -170,8 +176,9 @@ where
         let buckets = self.buckets.read();
         let lut = self.lut.read();
 
-        let bucket_idx = self.determine_bucket(key, self.num_buckets.load(SeqCst));
+        let bucket_idx = self.determine_bucket_mask(key, self.num_buckets.load(SeqCst) - 1);
         let capacity = self.capacity.load(SeqCst);
+        let capacity_mask = capacity - 1;
 
         let start = bucket_idx * 16;
         let mut idx = start;
@@ -193,7 +200,7 @@ where
                 }
 
                 idx += 1;
-                idx %= capacity;
+                idx &= capacity_mask;
                 continue;
             }
 
@@ -251,7 +258,9 @@ where
 
         let capacity = self.capacity.load(Relaxed);
         let num_buckets = self.num_buckets.load(Relaxed);
-        let mut bucket = self.determine_bucket(key as usize, num_buckets);
+
+        let num_buckets_mask = num_buckets - 1;
+        let mut bucket = self.determine_bucket_mask(key as usize, num_buckets_mask);
 
         'outer: loop {
             let start = bucket * 16;
@@ -299,7 +308,7 @@ where
             }
 
             bucket += 1;
-            bucket %= num_buckets;
+            bucket &= num_buckets_mask;
         }
     }
 
@@ -318,7 +327,8 @@ where
 
         let capacity = self.capacity.load(Relaxed);
         let num_buckets = self.num_buckets.load(Relaxed);
-        let mut bucket = self.determine_bucket(key as usize, num_buckets);
+        let num_buckets_mask = num_buckets - 1;
+        let mut bucket = self.determine_bucket_mask(key as usize, num_buckets_mask);
 
         loop {
             let start = bucket * 16;
@@ -351,7 +361,7 @@ where
             }
 
             bucket += 1;
-            bucket %= num_buckets;
+            bucket &= num_buckets_mask;
         }
     }
 
@@ -371,7 +381,8 @@ where
 
         let capacity = self.capacity.load(Relaxed);
         let num_buckets = self.num_buckets.load(Relaxed);
-        let mut bucket = self.determine_bucket(key as usize, num_buckets);
+        let num_buckets_mask = num_buckets - 1;
+        let mut bucket = self.determine_bucket_mask(key as usize, num_buckets_mask);
 
         loop {
             let start = bucket * 16;
@@ -405,7 +416,7 @@ where
             }
 
             bucket += 1;
-            bucket %= num_buckets;
+            bucket &= num_buckets_mask;
         }
     }
 }
